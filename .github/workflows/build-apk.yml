@@ -1,1 +1,433 @@
+name: Build APK
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+      - name: Generate the Android project
+        run: |
+          mkdir -p app/src/main/java/com/aiassistant app/src/main/assets
+          cat > settings.gradle <<'EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = 'AIAssistant'
+          include ':app'
+          EOF
+          cat > build.gradle <<'EOF'
+          plugins { id 'com.android.application' version '8.7.3' apply false }
+          EOF
+          echo 'org.gradle.jvmargs=-Xmx2g' > gradle.properties
+          cat > app/build.gradle <<'EOF'
+          plugins { id 'com.android.application' }
+          android {
+            namespace 'com.aiassistant'
+            compileSdk 34
+            defaultConfig { applicationId 'com.aiassistant'; minSdk 26; targetSdk 34; versionCode 1; versionName '1.0' }
+            compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+          }
+          EOF
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+            <uses-permission android:name="android.permission.INTERNET"/>
+            <application android:label="AI Assistant" android:allowBackup="false" android:theme="@android:style/Theme.Material.Light.DarkActionBar">
+              <activity android:name=".MainActivity" android:exported="true" android:windowSoftInputMode="adjustResize">
+                <intent-filter>
+                  <action android:name="android.intent.action.MAIN"/>
+                  <category android:name="android.intent.category.LAUNCHER"/>
+                </intent-filter>
+              </activity>
+            </application>
+          </manifest>
+          EOF
+          cat > app/src/main/assets/ai.yml <<'EOF'
+          name: AI Agent
+          on:
+            issues:
+              types: [labeled]
+            workflow_dispatch:
+          permissions:
+            contents: write
+            pull-requests: write
+          jobs:
+            run:
+              if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'agent'
+              runs-on: ubuntu-latest
+              timeout-minutes: 20
+              steps:
+                - uses: actions/checkout@v4
+                - uses: actions/setup-node@v4
+                  with:
+                    node-version: 20
+                - run: node .ai/agent.mjs
+                  env:
+                    GEMINI_API_KEY: @{{ secrets.GEMINI_API_KEY }}
+                    ANTHROPIC_API_KEY: @{{ secrets.ANTHROPIC_API_KEY }}
+                    GH_TOKEN: @{{ github.token }}
+                    AI_MODEL: @{{ vars.AI_MODEL }}
+                    ISSUE_NUMBER: @{{ github.event.issue.number }}
+                    ISSUE_TITLE: @{{ github.event.issue.title }}
+                    ISSUE_BODY: @{{ github.event.issue.body }}
+          EOF
+          sed -i 's/@{{/\x24{{/g' app/src/main/assets/ai.yml
+                    cat > app/src/main/assets/agent.mjs <<'EOF'
+          import fs from 'fs';
+          import {execSync,spawnSync} from 'child_process';
+          const E=process.env,N=E.ISSUE_NUMBER||('m'+Date.now()),BR='agent/task-'+N;
+          const rd=f=>fs.existsSync(f)?fs.readFileSync(f,'utf8'):'';
+          const sh=c=>execSync(c,{stdio:'pipe'}).toString();
+          const SEC=/(AIza[\w-]{35}|ghp_\w{20,}|github_pat_\w{20,}|sk-[\w-]{20,}|BEGIN [A-Z ]*PRIVATE KEY)/;
+          sh('git config user.name ai-agent && git config user.email ai-agent@users.noreply.github.com');
+          sh('git checkout -B '+BR);
+          const mem=['PROJECT','DECISIONS','TASKS','AGENTS','PROGRESS'].map(n=>'## '+n+'\n'+rd('.ai/'+n+'.md')).join('\n');
+          const tree=sh('git ls-files').split('\n').slice(0,300).join('\n');
+          const task=(E.ISSUE_TITLE||'Do the next unfinished task in TASKS.md')+'\n'+(E.ISSUE_BODY||'');
+          const prompt=['You are a careful coding agent. Follow AGENTS.md. Do ONLY the task below, with small, safe, reversible changes.',
+          'Reply with JSON only: {"summary":string,"files":[{"path":string,"content":string}],"memory_notes":string}. Each file is written in full. Never include secrets.',
+          'MEMORY:',mem,'REPO FILES:',tree,'TASK:',task].join('\n');
+          async function ask(p){
+            if(E.ANTHROPIC_API_KEY){
+              const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
+                headers:{'content-type':'application/json','x-api-key':E.ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},
+                body:JSON.stringify({model:E.AI_MODEL||'claude-haiku-5-5',max_tokens:8000,messages:[{role:'user',content:p}]})});
+              if(!r.ok)throw new Error('Claude API returned '+r.status);
+              return (await r.json()).content[0].text;
+            }
+            const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+(E.AI_MODEL||'gemini-2.5-flash')+':generateContent',
+              {method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':E.GEMINI_API_KEY||''},
+               body:JSON.stringify({contents:[{parts:[{text:p}]}],generationConfig:{responseMimeType:'application/json'}})});
+            if(!r.ok)throw new Error('Gemini API returned '+r.status);
+            return (await r.json()).candidates[0].content.parts[0].text;
+          }
+          let out=null,note='',res='no tests configured',written=[],blocked=[];
+          try{
+            out=JSON.parse((await ask(prompt)).replace(/^\s*```(json)?/,'').replace(/```\s*$/,''));
+            for(const f of out.files||[]){
+              const p=String(f.path||''),c=String(f.content||'');
+              if(!p||p.startsWith('/')||p.includes('..')||p.startsWith('.git')||p==='.ai/agent.mjs'||/(^|\/)\.env/.test(p)||SEC.test(c)){blocked.push(p);continue;}
+              fs.mkdirSync(p.includes('/')?p.slice(0,p.lastIndexOf('/')):'.',{recursive:true});
+              fs.writeFileSync(p,c);written.push(p);
+            }
+            if(/"test"\s*:/.test(rd('package.json'))){
+              try{sh('npm install --no-audit --no-fund');
+                const t=spawnSync('npm test',{shell:true,encoding:'utf8'});
+                res=t.status===0?'PASSED':'FAILED (exit '+t.status+')';
+              }catch(e){res='FAILED (npm install)';}
+            }
+          }catch(e){note='ERROR: '+e.message;}
+          const notes=out&&out.memory_notes&&!SEC.test(out.memory_notes)?out.memory_notes:'';
+          fs.mkdirSync('.ai',{recursive:true});
+          fs.appendFileSync('.ai/PROGRESS.md','\n## '+new Date().toISOString()+' - '+task.split('\n')[0]+
+            '\n- Result: '+(note||'AI response applied')+'\n- Files written: '+(written.join(', ')||'none')+
+            '\n- Blocked, needs your approval: '+(blocked.join(', ')||'none')+'\n- Tests: '+res+'\n- Notes: '+notes+'\n');
+          sh('git add -A');
+          sh('git commit -m "AI agent: '+task.split('\n')[0].replace(/["`$\\]/g,'')+'" --allow-empty');
+          sh('git push --force -u origin '+BR);
+          fs.writeFileSync('/tmp/pr.md',(out&&out.summary||note)+'\n\nTests: '+res+'\nBlocked files: '+(blocked.join(', ')||'none')+'\n\nReview before merging.');
+          spawnSync('gh',['pr','create','--head',BR,'--title',(note?'[FAILED] ':'')+task.split('\n')[0],'--body-file','/tmp/pr.md'],{stdio:'inherit'});
+          process.exit(note||res.startsWith('FAILED')?1:0);
+          EOF
+                    cat > app/src/main/java/com/aiassistant/MainActivity.java <<'EOF'
+          package com.aiassistant;
 
+          import android.app.Activity;
+          import android.content.ClipData;
+          import android.content.ClipboardManager;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.os.Bundle;
+          import android.text.InputType;
+          import android.util.Base64;
+          import android.view.View;
+          import android.widget.ArrayAdapter;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.Spinner;
+          import android.widget.TextView;
+          import java.io.ByteArrayOutputStream;
+          import java.io.InputStream;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import java.text.SimpleDateFormat;
+          import java.util.ArrayList;
+          import java.util.Arrays;
+          import java.util.Date;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.concurrent.ExecutorService;
+          import java.util.concurrent.Executors;
+          import java.util.regex.Pattern;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class MainActivity extends Activity {
+            static final Pattern SEC = Pattern.compile("(ghp_\\w{20,}|github_pat_\\w{20,}|AIza[\\w-]{35}|sk-[\\w-]{20,}|BEGIN [A-Z ]*PRIVATE KEY)");
+            static final String SUM = "Summarise this chat for project memory: goal, requirements, decisions with reasons, constraints, finished work, unfinished work, next steps. Short bullets. Leave out passwords, keys and tokens.";
+            static class R { int code; String body = ""; }
+
+            SharedPreferences sp;
+            ExecutorService ex = Executors.newSingleThreadExecutor();
+            LinearLayout box;
+            EditText tok, tt, tb, impBox;
+            Spinner repos, projs;
+            TextView logv, runsv;
+            long lastRun = 0;
+
+            @Override protected void onCreate(Bundle s) {
+              super.onCreate(s);
+              sp = getSharedPreferences("a", 0);
+              ScrollView sv = new ScrollView(this);
+              box = new LinearLayout(this);
+              box.setOrientation(LinearLayout.VERTICAL);
+              box.setPadding(24, 24, 24, 24);
+              sv.addView(box);
+              setContentView(sv);
+              tok = edit("Fine-grained GitHub token", false);
+              tok.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+              tok.setText(sp.getString("t", ""));
+              btn("Save token and load repositories", v -> loadRepos());
+              repos = new Spinner(this); box.addView(repos);
+              btn("Add project", v -> addP());
+              projs = new Spinner(this); box.addView(projs);
+              refreshP();
+              btn("1. Set up this repo (memory and agent)", v -> setup());
+              tt = edit("Task title", false);
+              tb = edit("Task details", true);
+              btn("2. Submit task to the agent", v -> task());
+              btn("Refresh runs", v -> runs());
+              btn("Cancel latest run", v -> act("cancel"));
+              btn("Retry latest run", v -> act("rerun"));
+              runsv = new TextView(this); box.addView(runsv);
+              impBox = edit("Paste a summary of an old chat", true);
+              btn("Save summary to memory", v -> save());
+              btn("Copy full context for a new chat", v -> ctx());
+              btn("Copy summarise-a-chat prompt", v -> { copy(SUM); log("Copied."); });
+              btn("Copy memory backup (JSON)", v -> exp());
+              logv = new TextView(this); box.addView(logv);
+              if (!sp.getString("t", "").isEmpty()) loadRepos();
+            }
+
+            Button btn(String t, View.OnClickListener l) {
+              Button b = new Button(this); b.setText(t); b.setAllCaps(false); b.setOnClickListener(l); box.addView(b); return b;
+            }
+            EditText edit(String hint, boolean multi) {
+              EditText e = new EditText(this); e.setHint(hint);
+              if (multi) { e.setMinLines(3); e.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_MULTI_LINE); }
+              box.addView(e); return e;
+            }
+            void fill(Spinner s, List<String> l) { s.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, l)); }
+            void log(String s) { runOnUiThread(() -> logv.setText(s)); }
+            void copy(String s) { runOnUiThread(() -> ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("t", s))); }
+            String cut(String s) { return s.length() > 200 ? s.substring(0, 200) : s; }
+            String cur() { Object o = projs.getSelectedItem(); return o == null ? "" : o.toString(); }
+            List<String> plist() { String s = sp.getString("p", ""); return s.isEmpty() ? new ArrayList<>() : new ArrayList<>(Arrays.asList(s.split(","))); }
+            void refreshP() { fill(projs, plist()); }
+
+            byte[] readAll(InputStream in) throws Exception {
+              ByteArrayOutputStream b = new ByteArrayOutputStream(); byte[] x = new byte[4096]; int n;
+              while ((n = in.read(x)) > 0) b.write(x, 0, n);
+              return b.toByteArray();
+            }
+
+            R api(String method, String path, String body) {
+              R r = new R();
+              try {
+                HttpURLConnection c = (HttpURLConnection) new URL("https://api.github.com" + path).openConnection();
+                c.setRequestMethod(method);
+                c.setRequestProperty("Authorization", "Bearer " + sp.getString("t", ""));
+                c.setRequestProperty("Accept", "application/vnd.github+json");
+                c.setConnectTimeout(15000); c.setReadTimeout(30000);
+                if (body != null) {
+                  c.setDoOutput(true);
+                  c.setRequestProperty("Content-Type", "application/json");
+                  try (OutputStream o = c.getOutputStream()) { o.write(body.getBytes(StandardCharsets.UTF_8)); }
+                }
+                r.code = c.getResponseCode();
+                InputStream in = r.code < 400 ? c.getInputStream() : c.getErrorStream();
+                r.body = in == null ? "" : new String(readAll(in), StandardCharsets.UTF_8);
+              } catch (Exception e) { r.code = -1; r.body = e.toString(); }
+              return r;
+            }
+
+            String rf(String repo, String p) throws Exception {
+              R r = api("GET", "/repos/" + repo + "/contents/" + p, null);
+              if (r.code != 200) return "";
+              return new String(Base64.decode(new JSONObject(r.body).getString("content"), Base64.DEFAULT), StandardCharsets.UTF_8);
+            }
+
+            String put(String repo, String path, String txt, boolean force) throws Exception {
+              String u = "/repos/" + repo + "/contents/" + path, sha = null;
+              R g = api("GET", u, null);
+              if (g.code == 200) {
+                if (!force) return path + ": already there";
+                sha = new JSONObject(g.body).getString("sha");
+              }
+              JSONObject b = new JSONObject().put("message", "AI assistant: add " + path)
+                  .put("content", Base64.encodeToString(txt.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP));
+              if (sha != null) b.put("sha", sha);
+              R p = api("PUT", u, b.toString());
+              if (p.code >= 300) throw new Exception(p.code + " " + cut(p.body));
+              return path + (sha == null ? ": added" : ": updated");
+            }
+
+            String asset(String n) throws Exception { return new String(readAll(getAssets().open(n)), StandardCharsets.UTF_8); }
+
+            void loadRepos() {
+              sp.edit().putString("t", tok.getText().toString().trim()).apply();
+              ex.execute(() -> {
+                R r = api("GET", "/user/repos?per_page=100&sort=updated", null);
+                if (r.code != 200) { log("Could not load repositories (" + r.code + "). " + cut(r.body)); return; }
+                try {
+                  JSONArray a = new JSONArray(r.body); List<String> l = new ArrayList<>();
+                  for (int i = 0; i < a.length(); i++) l.add(a.getJSONObject(i).getString("full_name"));
+                  runOnUiThread(() -> fill(repos, l));
+                  log("Repositories loaded: " + l.size());
+                } catch (Exception e) { log(e.toString()); }
+              });
+            }
+
+            void addP() {
+              Object o = repos.getSelectedItem(); if (o == null) return;
+              List<String> l = plist();
+              if (!l.contains(o.toString())) l.add(o.toString());
+              sp.edit().putString("p", String.join(",", l)).apply();
+              refreshP();
+            }
+
+            void setup() {
+              final String repo = cur();
+              if (repo.isEmpty()) { log("Add and select a project first."); return; }
+              ex.execute(() -> {
+                try {
+                  StringBuilder o = new StringBuilder();
+                  String[][] m = {
+                    {"PROJECT", "# Project\nGoal:\nRequirements:\nStatus:\n"},
+                    {"DECISIONS", "# Decisions\n(decision - reason)\n"},
+                    {"TASKS", "# Tasks\n## Pending\n## Done\n## Blocked\n"},
+                    {"AGENTS", "# Agent rules\n- Small, reversible changes only\n- Never touch .github or secrets\n- Never claim success without passing tests\n"},
+                    {"PROGRESS", "# Progress\n(checkpoints are added automatically)\n"}};
+                  for (String[] x : m) o.append(put(repo, ".ai/" + x[0] + ".md", x[1], false)).append("\n");
+                  o.append(put(repo, ".ai/agent.mjs", asset("agent.mjs"), true)).append("\n");
+                  o.append(put(repo, ".github/workflows/ai.yml", asset("ai.yml"), true)).append("\n");
+                  log(o + "\nLast steps in GitHub: add the secret GEMINI_API_KEY (or ANTHROPIC_API_KEY to use Claude) and allow Actions to create pull requests (Settings > Actions > General).");
+                } catch (Exception e) { log("Setup failed. " + e.getMessage() + "\nThe token needs Contents and Workflows write access for this repo."); }
+              });
+            }
+
+            void task() {
+              final String repo = cur(), t = tt.getText().toString().trim(), d = tb.getText().toString();
+              if (repo.isEmpty() || t.isEmpty()) { log("Select a project and enter a task title."); return; }
+              ex.execute(() -> {
+                try {
+                  JSONObject b = new JSONObject().put("title", t).put("body", d).put("labels", new JSONArray().put("agent"));
+                  R r = api("POST", "/repos/" + repo + "/issues", b.toString());
+                  if (r.code >= 300) { log("Could not submit (" + r.code + "). " + cut(r.body)); return; }
+                  log("Task #" + new JSONObject(r.body).getInt("number") + " submitted. Tap Refresh runs in a minute.");
+                  runOnUiThread(() -> { tt.setText(""); tb.setText(""); });
+                } catch (Exception e) { log(e.toString()); }
+              });
+            }
+
+            void runs() {
+              final String repo = cur(); if (repo.isEmpty()) return;
+              ex.execute(() -> {
+                R r = api("GET", "/repos/" + repo + "/actions/runs?per_page=5", null);
+                try {
+                  JSONArray a = new JSONObject(r.body).getJSONArray("workflow_runs"); StringBuilder s = new StringBuilder();
+                  for (int i = 0; i < a.length(); i++) {
+                    JSONObject j = a.getJSONObject(i); if (i == 0) lastRun = j.getLong("id");
+                    String c = j.isNull("conclusion") ? j.getString("status") : j.getString("conclusion");
+                    s.append(c).append(" - ").append(j.getString("display_title")).append("\n").append(j.getString("html_url")).append("\n\n");
+                  }
+                  final String t = s.length() == 0 ? "No runs yet." : s.toString();
+                  runOnUiThread(() -> runsv.setText(t));
+                } catch (Exception e) { log("Could not read runs (" + r.code + "). " + cut(r.body)); }
+              });
+            }
+
+            void act(String a) {
+              final String repo = cur(); if (repo.isEmpty() || lastRun == 0) { log("Tap Refresh runs first."); return; }
+              ex.execute(() -> {
+                R r = api("POST", "/repos/" + repo + "/actions/runs/" + lastRun + "/" + a, "{}");
+                log(r.code < 300 ? "Done: " + a : "Failed (" + r.code + "). " + cut(r.body));
+              });
+            }
+
+            void save() {
+              final String repo = cur(), t = impBox.getText().toString().trim();
+              if (repo.isEmpty() || t.isEmpty()) return;
+              if (SEC.matcher(t).find()) { log("Blocked: the text looks like it contains a key or token. Remove it first."); return; }
+              ex.execute(() -> {
+                try {
+                  String n = ".ai/imports/" + new SimpleDateFormat("yyyy-MM-dd-HHmmss", Locale.US).format(new Date()) + ".md";
+                  log(put(repo, n, t, false));
+                  runOnUiThread(() -> impBox.setText(""));
+                } catch (Exception e) { log(e.getMessage()); }
+              });
+            }
+
+            void ctx() {
+              final String repo = cur(); if (repo.isEmpty()) return;
+              ex.execute(() -> {
+                try {
+                  StringBuilder s = new StringBuilder("PROJECT CONTEXT for " + repo + ". Read all of this, then continue the next unfinished task in TASKS. Do not repeat finished work. If anything conflicts or is unclear, ask me before acting.\n");
+                  for (String k : new String[]{"PROJECT", "DECISIONS", "TASKS", "AGENTS"}) s.append("\n## ").append(k).append("\n").append(rf(repo, ".ai/" + k + ".md"));
+                  String pr = rf(repo, ".ai/PROGRESS.md");
+                  s.append("\n## LATEST PROGRESS\n").append(pr.length() > 3000 ? pr.substring(pr.length() - 3000) : pr);
+                  R d = api("GET", "/repos/" + repo + "/contents/.ai/imports", null);
+                  if (d.code == 200) {
+                    JSONArray a = new JSONArray(d.body);
+                    for (int i = Math.max(0, a.length() - 5); i < a.length(); i++) {
+                      String n = a.getJSONObject(i).getString("name");
+                      s.append("\n## CHAT SUMMARY ").append(n).append("\n").append(rf(repo, ".ai/imports/" + n));
+                    }
+                  }
+                  copy(s.toString());
+                  log("Copied " + s.length() + " characters. Paste it as the first message in the new chat.");
+                } catch (Exception e) { log(e.toString()); }
+              });
+            }
+
+            void exp() {
+              final String repo = cur(); if (repo.isEmpty()) return;
+              ex.execute(() -> {
+                try {
+                  JSONObject o = new JSONObject();
+                  for (String d : new String[]{".ai", ".ai/imports"}) {
+                    R r = api("GET", "/repos/" + repo + "/contents/" + d, null);
+                    if (r.code != 200) continue;
+                    JSONArray a = new JSONArray(r.body);
+                    for (int i = 0; i < a.length(); i++) {
+                      JSONObject f = a.getJSONObject(i); String n = f.getString("name");
+                      if (f.getString("type").equals("file") && !n.equals("agent.mjs")) o.put(d + "/" + n, rf(repo, d + "/" + n));
+                    }
+                  }
+                  copy(o.toString(1));
+                  log("Memory backup copied as JSON. Paste it into a notes app to keep it safe.");
+                } catch (Exception e) { log(e.toString()); }
+              });
+            }
+          }
+          EOF
+      - name: Build debug APK
+        run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ai-assistant-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
+          
