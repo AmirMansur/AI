@@ -51,92 +51,145 @@ jobs:
             </application>
           </manifest>
           EOF
-          cat > app/src/main/assets/ai.yml <<'EOF'
-          name: AI Agent
+          cat > app/src/main/assets/hub-agent.yml <<'EOF'
+          name: Agent
           on:
-            issues:
-              types: [labeled]
             workflow_dispatch:
+              inputs:
+                repo:
+                  description: owner/repo to build
+                  required: true
+                task:
+                  description: optional single task
+                  required: false
+                  default: ''
+                step:
+                  description: step counter
+                  required: false
+                  default: '1'
           permissions:
-            contents: write
-            pull-requests: write
+            contents: read
+            actions: write
+          concurrency:
+            group: agent-@{{ inputs.repo }}
+            cancel-in-progress: false
           jobs:
             run:
-              if: github.event_name == 'workflow_dispatch' || github.event.label.name == 'agent'
               runs-on: ubuntu-latest
-              timeout-minutes: 20
+              timeout-minutes: 30
               steps:
                 - uses: actions/checkout@v4
                 - uses: actions/setup-node@v4
                   with:
                     node-version: 20
-                - run: node .ai/agent.mjs
+                - run: node agent.mjs
                   env:
-                    GEMINI_API_KEY: @{{ secrets.GEMINI_API_KEY }}
                     ANTHROPIC_API_KEY: @{{ secrets.ANTHROPIC_API_KEY }}
-                    GH_TOKEN: @{{ github.token }}
+                    GH_PAT: @{{ secrets.GH_PAT }}
+                    GITHUB_TOKEN: @{{ github.token }}
+                    HUB: @{{ github.repository }}
+                    HUB_REF: @{{ github.ref_name }}
+                    TARGET: @{{ inputs.repo }}
+                    TASK: @{{ inputs.task }}
+                    STEP: @{{ inputs.step }}
                     AI_MODEL: @{{ vars.AI_MODEL }}
-                    ISSUE_NUMBER: @{{ github.event.issue.number }}
-                    ISSUE_TITLE: @{{ github.event.issue.title }}
-                    ISSUE_BODY: @{{ github.event.issue.body }}
+                    MAX_STEPS: @{{ vars.MAX_STEPS }}
           EOF
-          sed -i 's/@{{/\x24{{/g' app/src/main/assets/ai.yml
-                    cat > app/src/main/assets/agent.mjs <<'EOF'
+          sed -i 's/@{{/\x24{{/g' app/src/main/assets/hub-agent.yml
+                    cat > app/src/main/assets/hub-agent.mjs <<'EOF'
           import fs from 'fs';
-          import {execSync,spawnSync} from 'child_process';
-          const E=process.env,N=E.ISSUE_NUMBER||('m'+Date.now()),BR='agent/task-'+N;
-          const rd=f=>fs.existsSync(f)?fs.readFileSync(f,'utf8'):'';
-          const sh=c=>execSync(c,{stdio:'pipe'}).toString();
+          import {execSync} from 'child_process';
+          const E=process.env,TARGET=E.TARGET||'',HUB=E.HUB||'',PAT=E.GH_PAT||'',STEP=parseInt(E.STEP||'1'),MAXS=parseInt(E.MAX_STEPS||'8'),
+            MODEL=E.AI_MODEL||'claude-sonnet-5-5',BR='agent/build';
           const SEC=/(AIza[\w-]{35}|ghp_\w{20,}|github_pat_\w{20,}|sk-[\w-]{20,}|BEGIN [A-Z ]*PRIVATE KEY)/;
-          sh('git config user.name ai-agent && git config user.email ai-agent@users.noreply.github.com');
-          sh('git checkout -B '+BR);
-          const mem=['PROJECT','DECISIONS','TASKS','AGENTS','PROGRESS'].map(n=>'## '+n+'\n'+rd('.ai/'+n+'.md')).join('\n');
-          const tree=sh('git ls-files').split('\n').slice(0,300).join('\n');
-          const task=(E.ISSUE_TITLE||'Do the next unfinished task in TASKS.md')+'\n'+(E.ISSUE_BODY||'');
-          const prompt=['You are a careful coding agent. Follow AGENTS.md. Do ONLY the task below, with small, safe, reversible changes.',
-          'Reply with JSON only: {"summary":string,"files":[{"path":string,"content":string}],"memory_notes":string}. Each file is written in full. Never include secrets.',
-          'MEMORY:',mem,'REPO FILES:',tree,'TASK:',task].join('\n');
-          async function ask(p){
-            if(E.ANTHROPIC_API_KEY){
-              const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
-                headers:{'content-type':'application/json','x-api-key':E.ANTHROPIC_API_KEY,'anthropic-version':'2023-06-01'},
-                body:JSON.stringify({model:E.AI_MODEL||'claude-haiku-5-5',max_tokens:8000,messages:[{role:'user',content:p}]})});
-              if(!r.ok)throw new Error('Claude API returned '+r.status);
-              return (await r.json()).content[0].text;
-            }
-            const r=await fetch('https://generativelanguage.googleapis.com/v1beta/models/'+(E.AI_MODEL||'gemini-2.5-flash')+':generateContent',
-              {method:'POST',headers:{'Content-Type':'application/json','x-goog-api-key':E.GEMINI_API_KEY||''},
-               body:JSON.stringify({contents:[{parts:[{text:p}]}],generationConfig:{responseMimeType:'application/json'}})});
-            if(!r.ok)throw new Error('Gemini API returned '+r.status);
-            return (await r.json()).candidates[0].content.parts[0].text;
+          const clean=s=>String(s).split(PAT||'\u0000').join('***').split(E.ANTHROPIC_API_KEY||'\u0000').join('***');
+          const sh=c=>execSync(c,{stdio:'pipe',maxBuffer:1<<26}).toString();
+          const rd=f=>fs.existsSync(f)?fs.readFileSync(f,'utf8'):'';
+          const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+          const pj=t=>JSON.parse(t.slice(t.indexOf('{'),t.lastIndexOf('}')+1));
+          async function gh(m,p,b,tok){
+            const r=await fetch('https://api.github.com'+p,{method:m,headers:{Authorization:'Bearer '+(tok||PAT),Accept:'application/vnd.github+json','Content-Type':'application/json'},body:b?JSON.stringify(b):undefined});
+            const t=await r.text();let j=null;try{j=t?JSON.parse(t):null}catch(e){}
+            return {ok:r.ok,status:r.status,json:j};
           }
-          let out=null,note='',res='no tests configured',written=[],blocked=[];
-          try{
-            out=JSON.parse((await ask(prompt)).replace(/^\s*```(json)?/,'').replace(/```\s*$/,''));
+          let issue=0;
+          async function say(t){t=clean(t);console.log(t);if(issue)await gh('POST','/repos/'+TARGET+'/issues/'+issue+'/comments',{body:t});}
+          async function claude(prompt){
+            for(let a=0;a<3;a++){
+              const r=await fetch('https://api.anthropic.com/v1/messages',{method:'POST',
+                headers:{'content-type':'application/json','x-api-key':E.ANTHROPIC_API_KEY||'','anthropic-version':'2023-06-01'},
+                body:JSON.stringify({model:MODEL,max_tokens:16000,messages:[{role:'user',content:prompt}]})});
+              if(r.ok){const j=await r.json();return j.content.map(c=>c.text||'').join('');}
+              const t=await r.text();
+              if(r.status>=500&&a<2){await sleep(5000*(a+1));continue;}
+              const e=new Error('Claude API '+r.status+': '+t.slice(0,200));
+              e.paused=r.status===429||/credit|billing|quota|limit/i.test(t);throw e;
+            }
+          }
+          async function main(){
+            if(!/^[\w.-]+\/[\w.-]+$/.test(TARGET)||TARGET.split('/')[0]!==HUB.split('/')[0])throw new Error('Bad target repo');
+            const l=await gh('GET','/repos/'+TARGET+'/issues?labels=agent-log&state=open&per_page=1');
+            if(l.ok&&l.json&&l.json.length)issue=l.json[0].number;
+            else{const c=await gh('POST','/repos/'+TARGET+'/issues',{title:'Build log',body:'Live progress from the AI agent.',labels:['agent-log']});if(c.ok)issue=c.json.number;}
+            await say('Step '+STEP+' started (model '+MODEL+').');
+            sh('git clone https://x-access-token:'+PAT+'@github.com/'+TARGET+'.git work');
+            process.chdir('work');
+            sh('git config user.name ai-agent && git config user.email ai-agent@users.noreply.github.com');
+            sh(sh('git ls-remote --heads origin '+BR).trim()?'git checkout -B '+BR+' origin/'+BR:'git checkout -b '+BR);
+            fs.mkdirSync('.ai',{recursive:true});
+            let tasks=rd('.ai/TASKS.md');
+            if(!E.TASK&&!/^- \[[ x]\]/m.test(tasks)){
+              await say('Planning: turning your prompt into a task list.');
+              const p=pj(await claude('Read the PROJECT below and write a build plan of 4 to 10 small, ordered tasks, each doable in one coding session. JSON only: {"tasks":["..."]}\n\nPROJECT:\n'+rd('.ai/PROJECT.md')));
+              tasks='# Tasks\n'+p.tasks.map(t=>'- [ ] '+t).join('\n')+'\n';
+              fs.writeFileSync('.ai/TASKS.md',tasks);
+              await say('Plan:\n'+p.tasks.map((t,i)=>(i+1)+'. '+t).join('\n'));
+            }
+            const m=tasks.match(/^- \[ \] (.+)$/m),task=E.TASK||(m&&m[1]);
+            if(!task){await say('All tasks are done. Review the pull request and merge it when you are happy.');return;}
+            await say('Working on: '+task);
+            const files=sh('git ls-files').split('\n').filter(f=>f&&!f.startsWith('.ai/')&&!/(^|\/)node_modules\//.test(f)&&!/\.(png|jpe?g|gif|webp|ico|zip|jar|apk|lock|keystore|ttf|woff2?|mp4|pdf)$/i.test(f));
+            let budget=60000,code='';
+            for(const f of files){const t=rd(f);if(t.length>12000||t.length>budget)continue;budget-=t.length;code+='\n### '+f+'\n'+t;}
+            const out=pj(await claude(['You are a careful senior engineer building a project step by step. Do ONLY the task below and follow AGENTS.',
+              'Reply with JSON only: {"summary":string,"files":[{"path":string,"content":string}],"memory_notes":string,"task_done":boolean}. Each file is written in full. Never include secrets. If the project is an Android app, also keep a GitHub Actions workflow at .github/workflows/build-apk.yml (workflow file names must start with build).',
+              'PROJECT:',rd('.ai/PROJECT.md'),'DECISIONS:',rd('.ai/DECISIONS.md'),'AGENTS:',rd('.ai/AGENTS.md'),'PROGRESS (latest):',rd('.ai/PROGRESS.md').slice(-3000),'CODE:',code,'TASK:',task].join('\n')));
+            const written=[],blocked=[];
             for(const f of out.files||[]){
               const p=String(f.path||''),c=String(f.content||'');
-              if(!p||p.startsWith('/')||p.includes('..')||p.startsWith('.git')||p==='.ai/agent.mjs'||/(^|\/)\.env/.test(p)||SEC.test(c)){blocked.push(p);continue;}
+              if(!p||p.startsWith('/')||p.includes('..')||p.startsWith('.git/')||p.startsWith('.ai/')||/(^|\/)\.env/.test(p)||(p.startsWith('.github')&&!/^\.github\/workflows\/build[\w.-]*\.ya?ml$/.test(p))||SEC.test(c)){blocked.push(p);continue;}
               fs.mkdirSync(p.includes('/')?p.slice(0,p.lastIndexOf('/')):'.',{recursive:true});
               fs.writeFileSync(p,c);written.push(p);
             }
+            let res='no tests configured';
             if(/"test"\s*:/.test(rd('package.json'))){
-              try{sh('npm install --no-audit --no-fund');
-                const t=spawnSync('npm test',{shell:true,encoding:'utf8'});
-                res=t.status===0?'PASSED':'FAILED (exit '+t.status+')';
-              }catch(e){res='FAILED (npm install)';}
+              try{sh('npm install --no-audit --no-fund');sh('npm test');res='PASSED';}
+              catch(e){res='FAILED';}
             }
-          }catch(e){note='ERROR: '+e.message;}
-          const notes=out&&out.memory_notes&&!SEC.test(out.memory_notes)?out.memory_notes:'';
-          fs.mkdirSync('.ai',{recursive:true});
-          fs.appendFileSync('.ai/PROGRESS.md','\n## '+new Date().toISOString()+' - '+task.split('\n')[0]+
-            '\n- Result: '+(note||'AI response applied')+'\n- Files written: '+(written.join(', ')||'none')+
-            '\n- Blocked, needs your approval: '+(blocked.join(', ')||'none')+'\n- Tests: '+res+'\n- Notes: '+notes+'\n');
-          sh('git add -A');
-          sh('git commit -m "AI agent: '+task.split('\n')[0].replace(/["`$\\]/g,'')+'" --allow-empty');
-          sh('git push --force -u origin '+BR);
-          fs.writeFileSync('/tmp/pr.md',(out&&out.summary||note)+'\n\nTests: '+res+'\nBlocked files: '+(blocked.join(', ')||'none')+'\n\nReview before merging.');
-          spawnSync('gh',['pr','create','--head',BR,'--title',(note?'[FAILED] ':'')+task.split('\n')[0],'--body-file','/tmp/pr.md'],{stdio:'inherit'});
-          process.exit(note||res.startsWith('FAILED')?1:0);
+            const failed=res==='FAILED',done=out.task_done===true&&!failed;
+            if(done&&!E.TASK)fs.writeFileSync('.ai/TASKS.md',rd('.ai/TASKS.md').replace('- [ ] '+task,'- [x] '+task));
+            const notes=out.memory_notes&&!SEC.test(out.memory_notes)?out.memory_notes:'';
+            fs.appendFileSync('.ai/PROGRESS.md','\n## '+new Date().toISOString()+' - '+task+'\n- Files: '+(written.join(', ')||'none')+'\n- Blocked: '+(blocked.join(', ')||'none')+'\n- Tests: '+res+'\n- Task done: '+done+'\n- Notes: '+notes+'\n');
+            sh('git add -A');
+            sh('git commit -m "AI agent step '+STEP+'" --allow-empty');
+            sh('git push -u origin '+BR);
+            const info=(await gh('GET','/repos/'+TARGET)).json,owner=TARGET.split('/')[0];
+            const pr=await gh('GET','/repos/'+TARGET+'/pulls?state=open&head='+owner+':'+BR);
+            if(pr.ok&&pr.json&&!pr.json.length)await gh('POST','/repos/'+TARGET+'/pulls',{title:'AI build',head:BR,base:info.default_branch,body:'Work by the AI agent. Review, then merge.'});
+            await say('Finished: '+task+'\n'+(out.summary||'')+'\nFiles: '+(written.join(', ')||'none')+'\nBlocked (needs your approval): '+(blocked.join(', ')||'none')+'\nTests: '+res+'\nTask marked done: '+done);
+            const more=!E.TASK&&/^- \[ \]/m.test(rd('.ai/TASKS.md'));
+            if(failed||!done&&!E.TASK){await say('Stopped: this task is not finished or tests failed. Check the pull request, then tap Continue.');return;}
+            if(more&&STEP<MAXS){
+              const d=await gh('POST','/repos/'+HUB+'/actions/workflows/agent.yml/dispatches',{ref:E.HUB_REF||'main',inputs:{repo:TARGET,task:'',step:String(STEP+1)}},E.GITHUB_TOKEN);
+              if(!d.ok)await say('Could not start the next step ('+d.status+'). Tap Continue in the app.');
+            }else if(more)await say('Reached the safety limit of '+MAXS+' steps. Tap Continue in the app to run more.');
+            else await say('All tasks are done. Review the pull request and merge it when you are happy.');
+          }
+          main().catch(async e=>{
+            const m=clean(e.message||e);
+            try{await say(e.paused?'PAUSED: Claude refused the request ('+m+'). Add API credit or wait for the limit to reset, then tap Continue in the app. Your progress is saved.':'FAILED: '+m);}catch(x){console.log(m);}
+            process.exit(1);
+          });
           EOF
                     cat > app/src/main/java/com/aiassistant/MainActivity.java <<'EOF'
           package com.aiassistant;
@@ -146,7 +199,11 @@ jobs:
           import android.content.ClipboardManager;
           import android.content.Context;
           import android.content.SharedPreferences;
+          import android.graphics.Color;
+          import android.graphics.Typeface;
           import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
           import android.text.InputType;
           import android.util.Base64;
           import android.view.View;
@@ -178,15 +235,24 @@ jobs:
           public class MainActivity extends Activity {
             static final Pattern SEC = Pattern.compile("(ghp_\\w{20,}|github_pat_\\w{20,}|AIza[\\w-]{35}|sk-[\\w-]{20,}|BEGIN [A-Z ]*PRIVATE KEY)");
             static final String SUM = "Summarise this chat for project memory: goal, requirements, decisions with reasons, constraints, finished work, unfinished work, next steps. Short bullets. Leave out passwords, keys and tokens.";
+            static final String[][] MEM = {
+              {"PROJECT", ""},
+              {"DECISIONS", "# Decisions\n(decision - reason)\n"},
+              {"TASKS", "# Tasks\n"},
+              {"AGENTS", "# Agent rules\n- Small, reversible changes only\n- Never touch secrets\n- Never claim success without passing tests\n"},
+              {"PROGRESS", "# Progress\n(checkpoints are added automatically)\n"}};
             static class R { int code; String body = ""; }
 
             SharedPreferences sp;
             ExecutorService ex = Executors.newSingleThreadExecutor();
+            Handler h = new Handler(Looper.getMainLooper());
             LinearLayout box;
-            EditText tok, tt, tb, impBox;
+            EditText tok, hubBox, nameBox, promptBox, tt, tb, impBox;
             Spinner repos, projs;
-            TextView logv, runsv;
-            long lastRun = 0;
+            TextView logv, feedv;
+            Button autoB;
+            boolean auto = false;
+            Runnable tick = new Runnable() { public void run() { if (!auto) return; progress(); h.postDelayed(this, 10000); } };
 
             @Override protected void onCreate(Bundle s) {
               super.onCreate(s);
@@ -197,31 +263,47 @@ jobs:
               box.setPadding(24, 24, 24, 24);
               sv.addView(box);
               setContentView(sv);
-              tok = edit("Fine-grained GitHub token", false);
+              head("1. GitHub access", "Paste your GitHub token, then load your repositories.");
+              tok = edit("GitHub token", false);
               tok.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
               tok.setText(sp.getString("t", ""));
               btn("Save token and load repositories", v -> loadRepos());
+              head("2. The hub (one time)", "The hub is a private repo that runs the AI for all your projects. Create it once, then add two secrets in it on GitHub.");
+              hubBox = edit("Hub repo (owner/name)", false);
+              hubBox.setText(sp.getString("hub", ""));
+              btn("Create the hub", v -> mkHub());
+              head("3. New project from a prompt", "Describe what to build. The app creates the repo and the AI starts building.");
+              nameBox = edit("Project name, for example notes-app", false);
+              promptBox = edit("What should be built?", true);
+              btn("Create and build", v -> create());
+              head("4. Watch progress", "Choose a project to see what the AI is doing.");
               repos = new Spinner(this); box.addView(repos);
-              btn("Add project", v -> addP());
+              btn("Add this repo as a project", v -> addP());
               projs = new Spinner(this); box.addView(projs);
               refreshP();
-              btn("1. Set up this repo (memory and agent)", v -> setup());
+              btn("Refresh progress", v -> progress());
+              autoB = btn("Auto-refresh: off", v -> { auto = !auto; autoB.setText("Auto-refresh: " + (auto ? "on" : "off")); if (auto) h.post(tick); });
+              feedv = new TextView(this); box.addView(feedv);
+              btn("Continue building / resume", v -> go(""));
+              btn("Stop the running agent", v -> cancel());
+              head("5. Give one task", "Ask the AI to do one specific thing in the chosen project.");
               tt = edit("Task title", false);
               tb = edit("Task details", true);
-              btn("2. Submit task to the agent", v -> task());
-              btn("Refresh runs", v -> runs());
-              btn("Cancel latest run", v -> act("cancel"));
-              btn("Retry latest run", v -> act("rerun"));
-              runsv = new TextView(this); box.addView(runsv);
+              btn("Submit this task", v -> go(tt.getText().toString().trim() + "\n" + tb.getText().toString()));
+              head("6. Switching Claude accounts", "Save a summary of an old chat, then copy everything for the new chat.");
               impBox = edit("Paste a summary of an old chat", true);
               btn("Save summary to memory", v -> save());
               btn("Copy full context for a new chat", v -> ctx());
               btn("Copy summarise-a-chat prompt", v -> { copy(SUM); log("Copied."); });
-              btn("Copy memory backup (JSON)", v -> exp());
               logv = new TextView(this); box.addView(logv);
               if (!sp.getString("t", "").isEmpty()) loadRepos();
             }
 
+            void head(String t, String d) {
+              TextView a = new TextView(this); a.setText(t); a.setTextSize(18); a.setTypeface(null, Typeface.BOLD);
+              a.setTextColor(Color.parseColor("#1D4ED8")); a.setPadding(0, 36, 0, 4); box.addView(a);
+              TextView b = new TextView(this); b.setText(d); b.setTextSize(13); b.setTextColor(Color.parseColor("#6B7280")); box.addView(b);
+            }
             Button btn(String t, View.OnClickListener l) {
               Button b = new Button(this); b.setText(t); b.setAllCaps(false); b.setOnClickListener(l); box.addView(b); return b;
             }
@@ -232,9 +314,11 @@ jobs:
             }
             void fill(Spinner s, List<String> l) { s.setAdapter(new ArrayAdapter<>(this, android.R.layout.simple_spinner_dropdown_item, l)); }
             void log(String s) { runOnUiThread(() -> logv.setText(s)); }
+            void feed(String s) { runOnUiThread(() -> feedv.setText(s)); }
             void copy(String s) { runOnUiThread(() -> ((ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE)).setPrimaryClip(ClipData.newPlainText("t", s))); }
             String cut(String s) { return s.length() > 200 ? s.substring(0, 200) : s; }
             String cur() { Object o = projs.getSelectedItem(); return o == null ? "" : o.toString(); }
+            String hub() { return hubBox.getText().toString().trim(); }
             List<String> plist() { String s = sp.getString("p", ""); return s.isEmpty() ? new ArrayList<>() : new ArrayList<>(Arrays.asList(s.split(","))); }
             void refreshP() { fill(projs, plist()); }
 
@@ -287,6 +371,14 @@ jobs:
 
             String asset(String n) throws Exception { return new String(readAll(getAssets().open(n)), StandardCharsets.UTF_8); }
 
+            String dispatch(String hub, String repo, String task) {
+              try {
+                JSONObject in = new JSONObject().put("repo", repo).put("task", task).put("step", "1");
+                R r = api("POST", "/repos/" + hub + "/actions/workflows/agent.yml/dispatches", new JSONObject().put("ref", "main").put("inputs", in).toString());
+                return r.code == 204 ? "" : "Could not start the agent (" + r.code + "). " + cut(r.body) + "\nCheck that the hub has its two secrets and its files.";
+              } catch (Exception e) { return e.toString(); }
+            }
+
             void loadRepos() {
               sp.edit().putString("t", tok.getText().toString().trim()).apply();
               ex.execute(() -> {
@@ -295,6 +387,12 @@ jobs:
                 try {
                   JSONArray a = new JSONArray(r.body); List<String> l = new ArrayList<>();
                   for (int i = 0; i < a.length(); i++) l.add(a.getJSONObject(i).getString("full_name"));
+                  R u = api("GET", "/user", null);
+                  if (u.code == 200) {
+                    final String login = new JSONObject(u.body).getString("login");
+                    sp.edit().putString("login", login).apply();
+                    if (hub().isEmpty()) runOnUiThread(() -> hubBox.setText(login + "/ai-hub"));
+                  }
                   runOnUiThread(() -> fill(repos, l));
                   log("Repositories loaded: " + l.size());
                 } catch (Exception e) { log(e.toString()); }
@@ -309,62 +407,84 @@ jobs:
               refreshP();
             }
 
-            void setup() {
-              final String repo = cur();
-              if (repo.isEmpty()) { log("Add and select a project first."); return; }
+            void mkHub() {
+              final String login = sp.getString("login", "");
+              if (login.isEmpty()) { log("Tap Save token and load repositories first."); return; }
+              final String name = login + "/ai-hub";
               ex.execute(() -> {
                 try {
-                  StringBuilder o = new StringBuilder();
-                  String[][] m = {
-                    {"PROJECT", "# Project\nGoal:\nRequirements:\nStatus:\n"},
-                    {"DECISIONS", "# Decisions\n(decision - reason)\n"},
-                    {"TASKS", "# Tasks\n## Pending\n## Done\n## Blocked\n"},
-                    {"AGENTS", "# Agent rules\n- Small, reversible changes only\n- Never touch .github or secrets\n- Never claim success without passing tests\n"},
-                    {"PROGRESS", "# Progress\n(checkpoints are added automatically)\n"}};
-                  for (String[] x : m) o.append(put(repo, ".ai/" + x[0] + ".md", x[1], false)).append("\n");
-                  o.append(put(repo, ".ai/agent.mjs", asset("agent.mjs"), true)).append("\n");
-                  o.append(put(repo, ".github/workflows/ai.yml", asset("ai.yml"), true)).append("\n");
-                  log(o + "\nLast steps in GitHub: add the secret GEMINI_API_KEY (or ANTHROPIC_API_KEY to use Claude) and allow Actions to create pull requests (Settings > Actions > General).");
-                } catch (Exception e) { log("Setup failed. " + e.getMessage() + "\nThe token needs Contents and Workflows write access for this repo."); }
+                  R r = api("POST", "/user/repos", new JSONObject().put("name", "ai-hub").put("private", true).put("auto_init", true).put("description", "AI build hub").toString());
+                  if (r.code >= 300 && r.code != 422) { log("Could not create the hub (" + r.code + "). " + cut(r.body)); return; }
+                  Thread.sleep(2000);
+                  put(name, "agent.mjs", asset("hub-agent.mjs"), true);
+                  put(name, ".github/workflows/agent.yml", asset("hub-agent.yml"), true);
+                  sp.edit().putString("hub", name).apply();
+                  runOnUiThread(() -> hubBox.setText(name));
+                  log("Hub ready: " + name + "\nLast step, in that repo on GitHub: Settings > Secrets and variables > Actions > New repository secret. Add ANTHROPIC_API_KEY (your Claude API key) and GH_PAT (the same GitHub token you pasted here).");
+                } catch (Exception e) { log("Hub setup failed. " + e.getMessage() + "\nThe token needs Contents and Workflows write access, and permission to create repos."); }
               });
             }
 
-            void task() {
-              final String repo = cur(), t = tt.getText().toString().trim(), d = tb.getText().toString();
-              if (repo.isEmpty() || t.isEmpty()) { log("Select a project and enter a task title."); return; }
+            void create() {
+              final String hub = hub();
+              final String n = nameBox.getText().toString().trim().toLowerCase().replaceAll("[^a-z0-9._-]+", "-");
+              final String pr = promptBox.getText().toString().trim();
+              if (hub.isEmpty() || n.isEmpty() || pr.isEmpty()) { log("Create the hub first, then enter a project name and a prompt."); return; }
+              if (SEC.matcher(pr).find()) { log("Blocked: the prompt looks like it contains a key or token. Remove it first."); return; }
               ex.execute(() -> {
                 try {
-                  JSONObject b = new JSONObject().put("title", t).put("body", d).put("labels", new JSONArray().put("agent"));
-                  R r = api("POST", "/repos/" + repo + "/issues", b.toString());
-                  if (r.code >= 300) { log("Could not submit (" + r.code + "). " + cut(r.body)); return; }
-                  log("Task #" + new JSONObject(r.body).getInt("number") + " submitted. Tap Refresh runs in a minute.");
-                  runOnUiThread(() -> { tt.setText(""); tb.setText(""); });
-                } catch (Exception e) { log(e.toString()); }
+                  R r = api("POST", "/user/repos", new JSONObject().put("name", n).put("private", true).put("auto_init", true).toString());
+                  if (r.code >= 300) { log("Could not create the repo (" + r.code + "). " + cut(r.body) + "\nA fine-grained token cannot always create repos. If so, use a classic token with the repo and workflow scopes."); return; }
+                  final String repo = new JSONObject(r.body).getString("full_name");
+                  Thread.sleep(2000);
+                  for (String[] k : MEM) put(repo, ".ai/" + k[0] + ".md", k[0].equals("PROJECT") ? "# Project\n" + pr + "\n" : k[1], false);
+                  List<String> l = plist(); l.add(repo);
+                  sp.edit().putString("p", String.join(",", l)).apply();
+                  runOnUiThread(() -> { refreshP(); projs.setSelection(l.size() - 1); });
+                  String err = dispatch(hub, repo, "");
+                  log(err.isEmpty() ? "Created " + repo + " and started the agent. Tap Refresh progress in a minute." : "Created " + repo + " but: " + err);
+                } catch (Exception e) { log("Failed. " + e.getMessage()); }
               });
             }
 
-            void runs() {
+            void go(String task) {
+              final String hub = hub(), repo = cur();
+              if (hub.isEmpty() || repo.isEmpty()) { log("Select a project and set the hub first."); return; }
+              ex.execute(() -> {
+                String err = dispatch(hub, repo, task.trim());
+                log(err.isEmpty() ? "Agent started for " + repo + ". Tap Refresh progress." : err);
+              });
+            }
+
+            void progress() {
               final String repo = cur(); if (repo.isEmpty()) return;
               ex.execute(() -> {
-                R r = api("GET", "/repos/" + repo + "/actions/runs?per_page=5", null);
                 try {
-                  JSONArray a = new JSONObject(r.body).getJSONArray("workflow_runs"); StringBuilder s = new StringBuilder();
-                  for (int i = 0; i < a.length(); i++) {
-                    JSONObject j = a.getJSONObject(i); if (i == 0) lastRun = j.getLong("id");
-                    String c = j.isNull("conclusion") ? j.getString("status") : j.getString("conclusion");
-                    s.append(c).append(" - ").append(j.getString("display_title")).append("\n").append(j.getString("html_url")).append("\n\n");
-                  }
-                  final String t = s.length() == 0 ? "No runs yet." : s.toString();
-                  runOnUiThread(() -> runsv.setText(t));
-                } catch (Exception e) { log("Could not read runs (" + r.code + "). " + cut(r.body)); }
+                  JSONArray a = new JSONArray(api("GET", "/repos/" + repo + "/issues?labels=agent-log&state=all&per_page=1", null).body);
+                  if (a.length() == 0) { feed("No progress yet. The agent posts here once it starts."); return; }
+                  int n = a.getJSONObject(0).getInt("number");
+                  JSONArray c = new JSONArray(api("GET", "/repos/" + repo + "/issues/" + n + "/comments?per_page=100", null).body);
+                  StringBuilder s = new StringBuilder();
+                  for (int i = Math.max(0, c.length() - 12); i < c.length(); i++) s.append("- ").append(c.getJSONObject(i).getString("body")).append("\n\n");
+                  feed(s.length() == 0 ? "Waiting for the first update..." : s.toString());
+                } catch (Exception e) { feed("Could not read progress. " + e.getMessage()); }
               });
             }
 
-            void act(String a) {
-              final String repo = cur(); if (repo.isEmpty() || lastRun == 0) { log("Tap Refresh runs first."); return; }
+            void cancel() {
+              final String hub = hub(); if (hub.isEmpty()) return;
               ex.execute(() -> {
-                R r = api("POST", "/repos/" + repo + "/actions/runs/" + lastRun + "/" + a, "{}");
-                log(r.code < 300 ? "Done: " + a : "Failed (" + r.code + "). " + cut(r.body));
+                try {
+                  JSONArray a = new JSONObject(api("GET", "/repos/" + hub + "/actions/runs?per_page=5", null).body).getJSONArray("workflow_runs");
+                  for (int i = 0; i < a.length(); i++) {
+                    JSONObject j = a.getJSONObject(i);
+                    if (!j.getString("status").equals("completed")) {
+                      R r = api("POST", "/repos/" + hub + "/actions/runs/" + j.getLong("id") + "/cancel", "{}");
+                      log(r.code < 300 ? "Stopped the running agent." : "Could not stop it (" + r.code + ")."); return;
+                    }
+                  }
+                  log("No agent is running.");
+                } catch (Exception e) { log(e.toString()); }
               });
             }
 
@@ -399,26 +519,6 @@ jobs:
                   }
                   copy(s.toString());
                   log("Copied " + s.length() + " characters. Paste it as the first message in the new chat.");
-                } catch (Exception e) { log(e.toString()); }
-              });
-            }
-
-            void exp() {
-              final String repo = cur(); if (repo.isEmpty()) return;
-              ex.execute(() -> {
-                try {
-                  JSONObject o = new JSONObject();
-                  for (String d : new String[]{".ai", ".ai/imports"}) {
-                    R r = api("GET", "/repos/" + repo + "/contents/" + d, null);
-                    if (r.code != 200) continue;
-                    JSONArray a = new JSONArray(r.body);
-                    for (int i = 0; i < a.length(); i++) {
-                      JSONObject f = a.getJSONObject(i); String n = f.getString("name");
-                      if (f.getString("type").equals("file") && !n.equals("agent.mjs")) o.put(d + "/" + n, rf(repo, d + "/" + n));
-                    }
-                  }
-                  copy(o.toString(1));
-                  log("Memory backup copied as JSON. Paste it into a notes app to keep it safe.");
                 } catch (Exception e) { log(e.toString()); }
               });
             }
